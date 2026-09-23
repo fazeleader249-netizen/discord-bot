@@ -47,6 +47,38 @@ function saveMapping(mapping) {
     fs.writeFileSync(MAPPING_FILE, JSON.stringify(mapping, null, 2));
 }
 
+// Âm lượng mặc định và giới hạn (%)
+const DEFAULT_VOLUME = 100;
+const MIN_VOLUME = 1;
+const MAX_VOLUME = 200;
+
+// Chuẩn hóa entry trong mapping (hỗ trợ format cũ: displayName -> fileName)
+function getEntry(mapping, displayName) {
+    const value = mapping[displayName];
+    if (!value) return null;
+    if (typeof value === 'string') {
+        return { file: value, volume: DEFAULT_VOLUME };
+    }
+    return { file: value.file, volume: value.volume ?? DEFAULT_VOLUME };
+}
+
+// Tìm tên display (key trong mapping) không phân biệt hoa thường
+function findMappingKey(mapping, displayName) {
+    const lower = displayName.toLowerCase();
+    return Object.keys(mapping).find(key => key.toLowerCase() === lower) || null;
+}
+
+// Tạo tên file chưa tồn tại trong thư mục (tránh ghi đè file của sound khác)
+function createUniqueFileName(safeFileName, ext) {
+    let fileName = `${safeFileName}${ext}`;
+    let counter = 1;
+    while (fs.existsSync(path.join(SOUNDBOARD_DIR, fileName))) {
+        fileName = `${safeFileName}_${counter}${ext}`;
+        counter++;
+    }
+    return fileName;
+}
+
 // Hàm tạo tên file an toàn (không dấu, không khoảng trắng)
 function createSafeFileName(displayName) {
     return displayName
@@ -94,6 +126,37 @@ module.exports = {
                         .setDescription('File âm thanh (.mp3 hoặc .ogg)')
                         .setRequired(true)
                 )
+                .addIntegerOption(option =>
+                    option.setName('volume')
+                        .setDescription(`Âm lượng % (${MIN_VOLUME}-${MAX_VOLUME}, mặc định ${DEFAULT_VOLUME})`)
+                        .setRequired(false)
+                        .setMinValue(MIN_VOLUME)
+                        .setMaxValue(MAX_VOLUME)
+                )
+        )
+        .addSubcommand(subcommand =>
+            subcommand
+                .setName('edit')
+                .setDescription('Sửa tên hoặc âm lượng của âm thanh')
+                .addStringOption(option =>
+                    option.setName('name')
+                        .setDescription('Tên âm thanh cần sửa')
+                        .setRequired(true)
+                        .setAutocomplete(true)
+                )
+                .addStringOption(option =>
+                    option.setName('new_name')
+                        .setDescription('Tên mới (tối đa 30 ký tự)')
+                        .setRequired(false)
+                        .setMaxLength(30)
+                )
+                .addIntegerOption(option =>
+                    option.setName('volume')
+                        .setDescription(`Âm lượng % mới (${MIN_VOLUME}-${MAX_VOLUME})`)
+                        .setRequired(false)
+                        .setMinValue(MIN_VOLUME)
+                        .setMaxValue(MAX_VOLUME)
+                )
         )
         .addSubcommand(subcommand =>
             subcommand
@@ -134,6 +197,9 @@ module.exports = {
             case 'add':
                 await handleAdd(interaction);
                 break;
+            case 'edit':
+                await handleEdit(interaction);
+                break;
             case 'remove':
                 await handleRemove(interaction);
                 break;
@@ -159,22 +225,26 @@ function getSoundList() {
     for (const file of files) {
         // Tìm display name từ mapping
         let displayName = null;
-        for (const [name, fileName] of Object.entries(mapping)) {
-            if (fileName === file) {
+        let volume = DEFAULT_VOLUME;
+        for (const name of Object.keys(mapping)) {
+            const entry = getEntry(mapping, name);
+            if (entry.file === file) {
                 displayName = name;
+                volume = entry.volume;
                 break;
             }
         }
-        
+
         // Nếu không tìm thấy trong mapping, dùng tên file (bỏ extension)
         if (!displayName) {
             displayName = file.replace(/\.(mp3|ogg)$/, '');
         }
-        
+
         sounds.push({
             displayName: displayName,
             fileName: file,
-            ext: path.extname(file)
+            ext: path.extname(file),
+            volume: volume
         });
     }
     
@@ -320,6 +390,7 @@ async function handleAdd(interaction) {
 
     const displayName = interaction.options.getString('name').trim();
     const attachment = interaction.options.getAttachment('file');
+    const volume = interaction.options.getInteger('volume') ?? DEFAULT_VOLUME;
 
     // Validate độ dài
     if (displayName.length === 0 || displayName.length > 30) {
@@ -376,7 +447,7 @@ async function handleAdd(interaction) {
         // Xác định extension từ file gốc
         const originalExt = path.extname(attachment.name);
         const ext = (originalExt === '.ogg' || originalExt === '.mp3') ? originalExt : '.mp3';
-        const fileName = `${safeFileName}${ext}`;
+        const fileName = createUniqueFileName(safeFileName, ext);
         const filePath = path.join(SOUNDBOARD_DIR, fileName);
 
         // Download file
@@ -386,17 +457,120 @@ async function handleAdd(interaction) {
 
         // Lưu mapping
         const mapping = loadMapping();
-        mapping[displayName] = fileName;
+        mapping[displayName] = { file: fileName, volume };
         saveMapping(mapping);
 
         const reply = await interaction.editReply({
-            content: `✅ Đã thêm âm thanh **${displayName}** vào soundboard!`
+            content: `✅ Đã thêm âm thanh **${displayName}** (🔉 ${volume}%) vào soundboard!`
         });
         autoDeleteReply(reply);
     } catch (error) {
         console.error('Error saving soundboard file:', error);
         const reply = await interaction.editReply({
             content: '❌ Có lỗi xảy ra khi lưu file!'
+        });
+        autoDeleteReply(reply);
+    }
+}
+
+async function handleEdit(interaction) {
+    // Kiểm tra quyền
+    const member = interaction.member;
+    const hasPower = member?.permissions?.has(PermissionsBitField.Flags.Administrator) ||
+                     member?.permissions?.has(PermissionsBitField.Flags.ManageGuild);
+
+    if (!hasPower) {
+        const reply = await interaction.reply({
+            content: '❌ Bạn cần quyền **Administrator** hoặc **Manage Server** để sửa âm thanh!',
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+        return;
+    }
+
+    const displayName = interaction.options.getString('name');
+    const newNameRaw = interaction.options.getString('new_name');
+    const newName = newNameRaw ? newNameRaw.trim() : null;
+    const newVolume = interaction.options.getInteger('volume');
+
+    if (!newName && newVolume === null) {
+        const reply = await interaction.reply({
+            content: '❌ Hãy nhập ít nhất **new_name** hoặc **volume** để sửa!',
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+        return;
+    }
+
+    const mapping = loadMapping();
+    const entry = getEntry(mapping, displayName);
+
+    if (!entry) {
+        const reply = await interaction.reply({
+            content: `❌ Không tìm thấy âm thanh **${displayName}**!`,
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+        return;
+    }
+
+    if (newName !== null && (newName.length === 0 || newName.length > 30)) {
+        const reply = await interaction.reply({
+            content: '❌ Tên mới phải có từ 1-30 ký tự!',
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+        return;
+    }
+
+    // Kiểm tra trùng tên với âm thanh khác (không phân biệt hoa thường)
+    if (newName) {
+        const existingKey = findMappingKey(mapping, newName);
+        if (existingKey && existingKey !== displayName) {
+            const reply = await interaction.reply({
+                content: `❌ Âm thanh **${newName}** đã tồn tại! Hãy chọn tên khác.`,
+                ephemeral: true,
+                fetchReply: true
+            });
+            autoDeleteReply(reply);
+            return;
+        }
+    }
+
+    try {
+        const finalName = newName || displayName;
+        const finalVolume = newVolume ?? entry.volume;
+
+        delete mapping[displayName];
+        mapping[finalName] = { file: entry.file, volume: finalVolume };
+        saveMapping(mapping);
+
+        const changes = [];
+        if (newName && newName !== displayName) {
+            changes.push(`Tên: **${displayName}** → **${finalName}**`);
+        }
+        if (newVolume !== null && newVolume !== entry.volume) {
+            changes.push(`Âm lượng: **${entry.volume}%** → **${finalVolume}%**`);
+        }
+
+        const reply = await interaction.reply({
+            content: changes.length > 0
+                ? `✅ Đã cập nhật âm thanh!\n${changes.join('\n')}`
+                : `ℹ️ Không có thay đổi nào cho **${displayName}**.`,
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+    } catch (error) {
+        console.error('Error editing soundboard entry:', error);
+        const reply = await interaction.reply({
+            content: '❌ Có lỗi xảy ra khi sửa âm thanh!',
+            ephemeral: true,
+            fetchReply: true
         });
         autoDeleteReply(reply);
     }
@@ -419,11 +593,11 @@ async function handleRemove(interaction) {
     }
 
     const displayName = interaction.options.getString('name');
-    
+
     // Tìm file name từ mapping
     const mapping = loadMapping();
-    const fileName = mapping[displayName];
-    
+    const fileName = getEntry(mapping, displayName)?.file;
+
     if (!fileName) {
         const reply = await interaction.reply({
             content: `❌ Không tìm thấy âm thanh **${displayName}**!`,
@@ -486,7 +660,7 @@ async function handleList(interaction) {
 
     const embed = new EmbedBuilder()
         .setTitle('📋 Danh sách Soundboard')
-        .setDescription(sounds.map((s, i) => `${i + 1}. **${s.displayName}** (${s.ext})`).join('\n'))
+        .setDescription(sounds.map((s, i) => `${i + 1}. **${s.displayName}** (${s.ext}) — 🔉 ${s.volume}%`).join('\n'))
         .setColor('#00ff00')
         .setFooter({ text: `Tổng: ${sounds.length} âm thanh` })
         .setTimestamp();
@@ -510,9 +684,9 @@ async function playSound(interaction, displayName) {
 
     // Tìm file name từ mapping
     const mapping = loadMapping();
-    const fileName = mapping[displayName];
-    
-    if (!fileName) {
+    const entry = getEntry(mapping, displayName);
+
+    if (!entry) {
         const reply = await interaction.reply({
             content: `❌ Không tìm thấy âm thanh **${displayName}**!`,
             ephemeral: true,
@@ -522,7 +696,7 @@ async function playSound(interaction, displayName) {
         return;
     }
 
-    const filePath = path.join(SOUNDBOARD_DIR, fileName);
+    const filePath = path.join(SOUNDBOARD_DIR, entry.file);
 
     if (!fs.existsSync(filePath)) {
         const reply = await interaction.reply({
@@ -554,6 +728,7 @@ async function playSound(interaction, displayName) {
     queueData.queue.push({
         displayName,
         filePath,
+        volume: entry.volume,
         voiceChannel,
         interaction
     });
@@ -580,7 +755,7 @@ async function processQueue(guildId) {
     }
 
     queueData.isPlaying = true;
-    const { displayName, filePath, voiceChannel, interaction } = queueData.queue.shift();
+    const { displayName, filePath, volume, voiceChannel, interaction } = queueData.queue.shift();
 
     try {
         // Tạo hoặc lấy connection
@@ -605,8 +780,9 @@ async function processQueue(guildId) {
 
         const player = queueData.player;
 
-        // Tạo audio resource
-        const resource = createAudioResource(filePath);
+        // Tạo audio resource với âm lượng tùy chỉnh
+        const resource = createAudioResource(filePath, { inlineVolume: true });
+        resource.volume.setVolume(volume / 100);
         player.play(resource);
         connection.subscribe(player);
 
