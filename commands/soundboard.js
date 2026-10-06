@@ -16,7 +16,10 @@ const {
     entersState
 } = require('@discordjs/voice');
 const fs = require('fs');
+const os = require('os');
 const path = require('path');
+const { spawn } = require('child_process');
+const ffmpegPath = require('ffmpeg-static');
 
 // Thư mục lưu trữ soundboard files
 const SOUNDBOARD_DIR = path.join(__dirname, 'soundboard');
@@ -88,6 +91,31 @@ function createSafeFileName(displayName) {
         .replace(/[^a-zA-Z0-9]/g, '_') // Thay ký tự đặc biệt bằng _
         .toLowerCase()
         .substring(0, 50); // Giới hạn độ dài
+}
+
+// Thời gian chờ admin nghe thử và xác nhận trước khi hủy
+const PREVIEW_TIMEOUT = 5 * 60 * 1000;
+
+// Render file nghe thử (mp3) đã áp dụng âm lượng, giống cách bot phát trong voice
+function renderPreview(inputPath, volume) {
+    return new Promise((resolve, reject) => {
+        const ff = spawn(ffmpegPath, [
+            '-hide_banner', '-loglevel', 'error',
+            '-i', inputPath,
+            '-af', `volume=${volume / 100}`,
+            '-b:a', '128k',
+            '-f', 'mp3', 'pipe:1'
+        ]);
+        const chunks = [];
+        let stderr = '';
+        ff.stdout.on('data', chunk => chunks.push(chunk));
+        ff.stderr.on('data', data => { stderr += data; });
+        ff.on('error', reject);
+        ff.on('close', code => {
+            if (code === 0) resolve(Buffer.concat(chunks));
+            else reject(new Error(stderr || `ffmpeg exit code ${code}`));
+        });
+    });
 }
 
 // Queue để xử lý âm thanh tuần tự
@@ -440,37 +468,154 @@ async function handleAdd(interaction) {
         return;
     }
 
-    try {
-        // Tạo tên file an toàn
-        const safeFileName = createSafeFileName(displayName);
-        
-        // Xác định extension từ file gốc
-        const originalExt = path.extname(attachment.name);
-        const ext = (originalExt === '.ogg' || originalExt === '.mp3') ? originalExt : '.mp3';
-        const fileName = createUniqueFileName(safeFileName, ext);
-        const filePath = path.join(SOUNDBOARD_DIR, fileName);
+    // Xác định extension từ file gốc
+    const originalExt = path.extname(attachment.name);
+    const ext = (originalExt === '.ogg' || originalExt === '.mp3') ? originalExt : '.mp3';
 
-        // Download file
+    // Tải file về thư mục tạm, chỉ lưu vào soundboard khi admin bấm "Lưu"
+    const tempPath = path.join(os.tmpdir(), `soundboard_pending_${interaction.id}${ext}`);
+    try {
         const response = await fetch(attachment.url);
         const buffer = await response.arrayBuffer();
-        fs.writeFileSync(filePath, Buffer.from(buffer));
-
-        // Lưu mapping
-        const mapping = loadMapping();
-        mapping[displayName] = { file: fileName, volume };
-        saveMapping(mapping);
-
-        const reply = await interaction.editReply({
-            content: `✅ Đã thêm âm thanh **${displayName}** (🔉 ${volume}%) vào soundboard!`
-        });
-        autoDeleteReply(reply);
+        fs.writeFileSync(tempPath, Buffer.from(buffer));
     } catch (error) {
-        console.error('Error saving soundboard file:', error);
+        console.error('Error downloading soundboard file:', error);
         const reply = await interaction.editReply({
-            content: '❌ Có lỗi xảy ra khi lưu file!'
+            content: '❌ Có lỗi xảy ra khi tải file!'
         });
         autoDeleteReply(reply);
+        return;
     }
+
+    await showAddPreview(interaction, { displayName, tempPath, ext, volume });
+}
+
+// Hiển thị bản demo để admin nghe thử, chỉnh âm lượng rồi mới lưu
+async function showAddPreview(interaction, { displayName, tempPath, ext, volume: initialVolume }) {
+    let volume = initialVolume;
+
+    const createComponents = () => [
+        new ActionRowBuilder().addComponents(
+            ...[-25, -10, 10, 25].map(step =>
+                new ButtonBuilder()
+                    .setCustomId(`preview_vol_${step}`)
+                    .setLabel(`${step > 0 ? '+' : ''}${step}%`)
+                    .setEmoji(step > 0 ? '🔊' : '🔉')
+                    .setStyle(ButtonStyle.Secondary)
+                    .setDisabled(step > 0 ? volume >= MAX_VOLUME : volume <= MIN_VOLUME)
+            )
+        ),
+        new ActionRowBuilder().addComponents(
+            new ButtonBuilder()
+                .setCustomId('preview_voice')
+                .setLabel('Thử trong voice')
+                .setEmoji('🎧')
+                .setStyle(ButtonStyle.Primary),
+            new ButtonBuilder()
+                .setCustomId('preview_save')
+                .setLabel('Lưu')
+                .setEmoji('✅')
+                .setStyle(ButtonStyle.Success),
+            new ButtonBuilder()
+                .setCustomId('preview_cancel')
+                .setLabel('Hủy')
+                .setEmoji('❌')
+                .setStyle(ButtonStyle.Danger)
+        )
+    ];
+
+    // Render lại file demo theo âm lượng hiện tại và cập nhật tin nhắn
+    const renderMessage = async () => {
+        let content = `🎧 **Bản demo: ${displayName}** — 🔉 **${volume}%**\n` +
+            `Nghe file bên dưới (đã áp dụng âm lượng), chỉnh bằng các nút rồi bấm **Lưu**.\n` +
+            `💡 Bấm **Thử trong voice** để nghe đúng như khi phát trên kênh voice.\n` +
+            `⏳ Tự hủy sau ${PREVIEW_TIMEOUT / 60000} phút nếu không lưu.`;
+        const files = [];
+        try {
+            const previewBuffer = await renderPreview(tempPath, volume);
+            files.push(new AttachmentBuilder(previewBuffer, { name: `demo_${volume}.mp3` }));
+        } catch (error) {
+            console.error('Error rendering soundboard preview:', error);
+            content += `\n⚠️ Không tạo được file nghe thử, hãy dùng nút **Thử trong voice**.`;
+        }
+        return await interaction.editReply({
+            content,
+            files,
+            attachments: [],
+            components: createComponents()
+        });
+    };
+
+    const message = await renderMessage();
+
+    const collector = message.createMessageComponentCollector({ time: PREVIEW_TIMEOUT });
+
+    collector.on('collect', async (i) => {
+        try {
+            if (i.customId.startsWith('preview_vol_')) {
+                const step = parseInt(i.customId.replace('preview_vol_', ''), 10);
+                volume = Math.min(MAX_VOLUME, Math.max(MIN_VOLUME, volume + step));
+                await i.deferUpdate();
+                await renderMessage();
+                return;
+            }
+
+            if (i.customId === 'preview_voice') {
+                await enqueueSound(i, `${displayName} (demo)`, tempPath, volume);
+                return;
+            }
+
+            if (i.customId === 'preview_cancel') {
+                await i.update({ content: `🗑️ Đã hủy thêm âm thanh **${displayName}**.`, files: [], attachments: [], components: [] });
+                collector.stop('cancelled');
+                autoDeleteReply(message);
+                return;
+            }
+
+            if (i.customId === 'preview_save') {
+                // Kiểm tra lại trùng tên (có thể đã có người thêm trong lúc nghe thử)
+                const mapping = loadMapping();
+                if (findMappingKey(mapping, displayName)) {
+                    await i.reply({
+                        content: `❌ Âm thanh **${displayName}** vừa được thêm bởi người khác! Hãy hủy và dùng tên khác.`,
+                        ephemeral: true
+                    });
+                    return;
+                }
+
+                const fileName = createUniqueFileName(createSafeFileName(displayName), ext);
+                fs.copyFileSync(tempPath, path.join(SOUNDBOARD_DIR, fileName));
+                mapping[displayName] = { file: fileName, volume };
+                saveMapping(mapping);
+
+                await i.update({
+                    content: `✅ Đã thêm âm thanh **${displayName}** (🔉 ${volume}%) vào soundboard!`,
+                    files: [],
+                    attachments: [],
+                    components: []
+                });
+                collector.stop('saved');
+                autoDeleteReply(message);
+            }
+        } catch (error) {
+            console.error('Error handling soundboard preview:', error);
+            const payload = { content: '❌ Có lỗi xảy ra!', ephemeral: true };
+            (i.deferred || i.replied ? i.followUp(payload) : i.reply(payload)).catch(() => {});
+        }
+    });
+
+    collector.on('end', (_, reason) => {
+        if (reason === 'time') {
+            interaction.editReply({
+                content: `⌛ Hết thời gian, âm thanh **${displayName}** chưa được lưu.`,
+                files: [],
+                attachments: [],
+                components: []
+            }).then(autoDeleteReply).catch(() => {});
+        }
+        // Đợi thêm để bản thử trong voice (nếu đang phát) không bị mất file
+        setTimeout(() => fs.rm(tempPath, { force: true }, () => {}), 60_000);
+    });
 }
 
 async function handleEdit(interaction) {
@@ -669,19 +814,6 @@ async function handleList(interaction) {
 }
 
 async function playSound(interaction, displayName) {
-    const member = interaction.member;
-    const voiceChannel = member?.voice?.channel;
-
-    if (!voiceChannel) {
-        const reply = await interaction.reply({
-            content: '❌ Bạn phải ở trong voice channel!',
-            ephemeral: true,
-            fetchReply: true
-        });
-        autoDeleteReply(reply);
-        return;
-    }
-
     // Tìm file name từ mapping
     const mapping = loadMapping();
     const entry = getEntry(mapping, displayName);
@@ -701,6 +833,23 @@ async function playSound(interaction, displayName) {
     if (!fs.existsSync(filePath)) {
         const reply = await interaction.reply({
             content: `❌ File âm thanh không tồn tại!`,
+            ephemeral: true,
+            fetchReply: true
+        });
+        autoDeleteReply(reply);
+        return;
+    }
+
+    await enqueueSound(interaction, displayName, filePath, entry.volume);
+}
+
+// Thêm âm thanh vào hàng đợi phát trong voice channel của người bấm
+async function enqueueSound(interaction, displayName, filePath, volume) {
+    const voiceChannel = interaction.member?.voice?.channel;
+
+    if (!voiceChannel) {
+        const reply = await interaction.reply({
+            content: '❌ Bạn phải ở trong voice channel!',
             ephemeral: true,
             fetchReply: true
         });
@@ -728,7 +877,7 @@ async function playSound(interaction, displayName) {
     queueData.queue.push({
         displayName,
         filePath,
-        volume: entry.volume,
+        volume,
         voiceChannel,
         interaction
     });

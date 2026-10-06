@@ -1,4 +1,4 @@
-const { SlashCommandBuilder } = require('discord.js');
+const { SlashCommandBuilder, PermissionsBitField } = require('discord.js');
 const path = require('path');
 const fs = require('fs');
 const {
@@ -55,6 +55,54 @@ function saveAbbreviations(abbreviations) {
     console.error('Lỗi khi save từ viết tắt:', error);
     return false;
   }
+}
+
+// File lưu lịch sử lệnh /r say (chỉ admin xem được qua /r logs)
+const SAY_LOGS_FILE = path.join(__dirname, '../data', 'say_logs.json');
+const MAX_LOGS_PER_GUILD = 1000;
+const MAX_LOGS_QUERY = 100;
+
+function loadSayLogs() {
+  try {
+    if (fs.existsSync(SAY_LOGS_FILE)) {
+      return JSON.parse(fs.readFileSync(SAY_LOGS_FILE, 'utf8'));
+    }
+  } catch (error) {
+    console.error('Lỗi khi load say logs:', error);
+  }
+  return {};
+}
+
+// Ghi lại text người dùng đã cho bot nói (theo từng server)
+function appendSayLog(interaction, originalText, expandedText) {
+  try {
+    const dataDir = path.join(__dirname, '../data');
+    if (!fs.existsSync(dataDir)) {
+      fs.mkdirSync(dataDir, { recursive: true });
+    }
+
+    const logs = loadSayLogs();
+    const guildId = interaction.guildId ?? 'dm';
+    const guildLogs = logs[guildId] ?? [];
+
+    guildLogs.push({
+      time: Date.now(),
+      userId: interaction.user.id,
+      name: getDisplayName(interaction.member),
+      originalText,
+      expandedText
+    });
+
+    logs[guildId] = guildLogs.slice(-MAX_LOGS_PER_GUILD);
+    fs.writeFileSync(SAY_LOGS_FILE, JSON.stringify(logs, null, 2), 'utf8');
+  } catch (error) {
+    console.error('Lỗi khi lưu say log:', error);
+  }
+}
+
+function isAdmin(member) {
+  return member?.permissions?.has(PermissionsBitField.Flags.Administrator) ||
+         member?.permissions?.has(PermissionsBitField.Flags.ManageGuild);
 }
 
 // Helper function để escape các ký tự đặc biệt trong regex
@@ -136,6 +184,18 @@ module.exports = {
             .setDescription('Từ viết tắt muốn xóa (để trống để xem danh sách)')
             .setRequired(false)
         )
+    )
+    .addSubcommand(subcommand =>
+      subcommand
+        .setName('logs')
+        .setDescription('[Admin] Xem lại các đoạn text đã cho bot nói')
+        .addIntegerOption(option =>
+          option.setName('lines')
+            .setDescription(`Số dòng muốn xem (mặc định 10, tối đa ${MAX_LOGS_QUERY})`)
+            .setMinValue(1)
+            .setMaxValue(MAX_LOGS_QUERY)
+            .setRequired(false)
+        )
     ),
 
   async execute(interaction) {
@@ -149,9 +209,56 @@ module.exports = {
       await handleRemoveAbbreviation(interaction);
     } else if (subcommand === 'say') {
       await handleSayCommand(interaction);
+    } else if (subcommand === 'logs') {
+      await handleLogsCommand(interaction);
     }
   }
 };
+
+async function handleLogsCommand(interaction) {
+  if (!isAdmin(interaction.member)) {
+    return await interaction.reply({
+      content: '❌ Bạn cần quyền **Administrator** hoặc **Manage Server** để xem logs!',
+      ephemeral: true
+    });
+  }
+
+  await interaction.deferReply({ ephemeral: true });
+
+  const lines = interaction.options.getInteger('lines') ?? 10;
+  const guildLogs = loadSayLogs()[interaction.guildId ?? 'dm'] ?? [];
+
+  if (guildLogs.length === 0) {
+    return await interaction.editReply('📝 Chưa có log nào!');
+  }
+
+  const entries = guildLogs.slice(-lines).map(log => {
+    const time = `<t:${Math.floor(log.time / 1000)}:f>`;
+    let line = `${time} **${log.name}**: ${log.expandedText}`;
+    if (log.expandedText !== log.originalText) {
+      line += ` _(từ: ${log.originalText})_`;
+    }
+    return line;
+  });
+
+  // Chia thành nhiều tin nhắn nếu vượt giới hạn 2000 ký tự của Discord
+  const chunks = [];
+  let current = `📜 **${entries.length} dòng log gần nhất:**\n`;
+  for (const entry of entries) {
+    const line = entry.length > 1900 ? entry.substring(0, 1900) + '...' : entry;
+    if (current.length + line.length + 1 > 2000) {
+      chunks.push(current);
+      current = '';
+    }
+    current += line + '\n';
+  }
+  chunks.push(current);
+
+  await interaction.editReply(chunks[0]);
+  for (const chunk of chunks.slice(1)) {
+    await interaction.followUp({ content: chunk, ephemeral: true });
+  }
+}
 
 async function handleAddAbbreviation(interaction) {
   await interaction.deferReply();
@@ -281,14 +388,17 @@ async function handleSayCommand(interaction) {
     return;
   }
 
-  // Kiểm tra nếu text chứa "truongcaytv" (không phân biệt hoa thường)
-  if (originalText.toLowerCase().includes('truongcaytv')) {
-    await handleSpecialSound(interaction, channelId, voiceChannel, 'test.mp3', originalText);
-    return;
-  }
-
   // Thay thế từ viết tắt
   const expandedText = expandAbbreviations(originalText);
+
+  // Lưu lại text (không hiển thị công khai, admin xem qua /r logs)
+  appendSayLog(interaction, originalText, expandedText);
+
+  // Kiểm tra nếu text chứa "truongcaytv" (không phân biệt hoa thường)
+  if (originalText.toLowerCase().includes('truongcaytv')) {
+    await handleSpecialSound(interaction, channelId, voiceChannel, 'test.mp3');
+    return;
+  }
 
   // Text đưa vào TTS theo format yêu cầu
   const ttsText = `${callerName} đã nói: ${expandedText}`;
@@ -302,19 +412,13 @@ async function handleSayCommand(interaction) {
   queue.push({
     interaction,
     text: ttsText,              // dùng để TTS
-    expandedText: expandedText,  // dùng để hiển thị
-    originalText: originalText,  // giữ để hiển thị map viết tắt
     member,
     voiceChannel
   });
 
   // Nếu đang phát thì thông báo đã thêm vào hàng đợi
   if (activeChannels.get(channelId)) {
-    let replyMsg = `✅ **${callerName}** đã thêm vào hàng đợi (vị trí: ${queue.length})`;
-    if (expandedText !== originalText) {
-      replyMsg += `\n📝 **${originalText}** → **${expandedText}**`;
-    }
-    await interaction.editReply(replyMsg);
+    await interaction.editReply(`✅ **${callerName}** đã thêm vào hàng đợi (vị trí: ${queue.length})`);
     return;
   }
 
@@ -322,7 +426,7 @@ async function handleSayCommand(interaction) {
   await processQueue(channelId);
 }
 
-async function handleSpecialSound(interaction, channelId, voiceChannel, soundFileName, originalText) {
+async function handleSpecialSound(interaction, channelId, voiceChannel, soundFileName) {
   try {
     const callerName = getDisplayName(interaction.member);
 
@@ -358,7 +462,7 @@ async function handleSpecialSound(interaction, channelId, voiceChannel, soundFil
     player.play(resource);
     connection.subscribe(player);
 
-    await interaction.editReply(`🎵 **${callerName}**: "${originalText}" - Phát âm thanh đặc biệt!`);
+    await interaction.editReply(`🎵 **${callerName}**: "..." - Phát âm thanh đặc biệt!`);
 
     // Khi phát xong
     player.once(AudioPlayerStatus.Idle, async () => {
@@ -490,7 +594,7 @@ async function processQueue(channelId) {
   // Đánh dấu channel đang active
   activeChannels.set(channelId, true);
 
-  const { interaction, text, expandedText, originalText, member, voiceChannel } = queue.shift();
+  const { interaction, text, member, voiceChannel } = queue.shift();
   const callerName = getDisplayName(member);
 
   const filePath = path.join(__dirname, '../sounds', `repeat_${member.id}_${Date.now()}.mp3`);
@@ -551,13 +655,8 @@ async function processQueue(channelId) {
     player.play(resource);
     connection.subscribe(player);
 
-    // Hiển thị UI theo expandedText (không hiển thị cả "đã nói" trong message nếu bạn không muốn)
-    const shownText = expandedText ?? text;
-    let replyMsg = `🔊 **${callerName}** đang nói: "${shownText.substring(0, 100)}${shownText.length > 100 ? '...' : ''}"`;
-    if (expandedText && expandedText !== originalText) {
-      replyMsg += `\n📝 (từ: "${originalText}")`;
-    }
-    await interaction.editReply(replyMsg);
+    // Ẩn nội dung, chỉ hiện người nói (admin xem lại bằng /r logs)
+    await interaction.editReply(`🔊 **${callerName}** đang nói: "..."`);
 
     // Khi phát xong
     player.once(AudioPlayerStatus.Idle, async () => {
