@@ -3,6 +3,7 @@ const path = require('path')
 const { EventEmitter } = require('stream')
 const axios = require('axios');
 const fs = require('fs');
+const { isKaraokeActive } = require('../commands/karaoke');
 
 const {
     joinVoiceChannel,
@@ -29,7 +30,8 @@ module.exports = {
         // Khi ai đó vào voice
         if (!oldState.channel && newState.channel) {
             console.log(`${member.user.tag} đã vào kênh voice: ${newState.channel.name}`);
-            welcomeToChannel(member);
+            // Đang karaoke thì không chào để khỏi cắt ngang bài hát
+            if (!isKaraokeActive(newState.guild.id)) welcomeToChannel(member);
         }
 
         // Khi ai đó rời voice
