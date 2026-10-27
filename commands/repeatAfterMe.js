@@ -142,6 +142,8 @@ function expandAbbreviations(text) {
 }
 
 module.exports = {
+  enqueueSpeech,
+
   data: new SlashCommandBuilder()
     .setName('r')
     .setDescription('Bot sẽ nói lại đoạn text bạn nhập')
@@ -403,27 +405,57 @@ async function handleSayCommand(interaction) {
   // Text đưa vào TTS theo format yêu cầu
   const ttsText = `${callerName} đã nói: ${expandedText}`;
 
-  // Thêm vào queue
+  const position = await enqueueSpeech(voiceChannel, member, ttsText, {
+    // Ẩn nội dung, chỉ hiện người nói (admin xem lại bằng /r logs)
+    onStart: () => interaction.editReply(`🔊 **${callerName}** đang nói: "..."`),
+    onDone: () => {
+      // Xóa tin nhắn reply
+      setTimeout(async () => {
+        try {
+          await interaction.deleteReply();
+        } catch (error) {
+          console.error('Không thể xóa tin nhắn:', error);
+        }
+      }, 2000);
+    },
+    onError: () => interaction.editReply('❌ Có lỗi xảy ra khi tạo/phát audio! Vui lòng thử lại.')
+  });
+
+  // Nếu đang phát thì thông báo đã thêm vào hàng đợi
+  if (position > 0) {
+    await interaction.editReply(`✅ **${callerName}** đã thêm vào hàng đợi (vị trí: ${position})`);
+  }
+}
+
+// Thêm 1 câu vào hàng đợi đọc của voice channel (dùng chung cho /r say, /khen, /khia)
+// callbacks: onStart (bắt đầu đọc), onDone (đọc xong), onError (lỗi tạo/phát audio)
+// Trả về vị trí trong hàng đợi, 0 nếu được đọc ngay
+async function enqueueSpeech(voiceChannel, member, text, callbacks = {}) {
+  const channelId = voiceChannel.id;
+
   if (!channelQueues.has(channelId)) {
     channelQueues.set(channelId, []);
   }
 
   const queue = channelQueues.get(channelId);
-  queue.push({
-    interaction,
-    text: ttsText,              // dùng để TTS
-    member,
-    voiceChannel
-  });
+  queue.push({ text, member, voiceChannel, ...callbacks });
 
-  // Nếu đang phát thì thông báo đã thêm vào hàng đợi
   if (activeChannels.get(channelId)) {
-    await interaction.editReply(`✅ **${callerName}** đã thêm vào hàng đợi (vị trí: ${queue.length})`);
-    return;
+    return queue.length;
   }
 
   // Nếu không có gì đang phát, bắt đầu process queue
   await processQueue(channelId);
+  return 0;
+}
+
+// Lỗi trong callback không được làm hỏng hàng đợi
+async function runCallback(callback) {
+  try {
+    await callback?.();
+  } catch (error) {
+    console.error('Lỗi callback hàng đợi đọc:', error);
+  }
 }
 
 async function handleSpecialSound(interaction, channelId, voiceChannel, soundFileName) {
@@ -594,8 +626,7 @@ async function processQueue(channelId) {
   // Đánh dấu channel đang active
   activeChannels.set(channelId, true);
 
-  const { interaction, text, member, voiceChannel } = queue.shift();
-  const callerName = getDisplayName(member);
+  const { text, member, voiceChannel, onStart, onDone, onError } = queue.shift();
 
   const filePath = path.join(__dirname, '../sounds', `repeat_${member.id}_${Date.now()}.mp3`);
 
@@ -655,8 +686,7 @@ async function processQueue(channelId) {
     player.play(resource);
     connection.subscribe(player);
 
-    // Ẩn nội dung, chỉ hiện người nói (admin xem lại bằng /r logs)
-    await interaction.editReply(`🔊 **${callerName}** đang nói: "..."`);
+    await runCallback(onStart);
 
     // Khi phát xong
     player.once(AudioPlayerStatus.Idle, async () => {
@@ -674,14 +704,7 @@ async function processQueue(channelId) {
         }
       }, 1000);
 
-      // Xóa tin nhắn reply
-      setTimeout(async () => {
-        try {
-          await interaction.deleteReply();
-        } catch (error) {
-          console.error('Không thể xóa tin nhắn:', error);
-        }
-      }, 2000);
+      runCallback(onDone);
 
       // Kiểm tra xem còn gì trong queue không
       const remainingQueue = channelQueues.get(channelId);
@@ -713,7 +736,7 @@ async function processQueue(channelId) {
 
   } catch (error) {
     console.error('Lỗi khi phát audio:', error);
-    await interaction.editReply('❌ Có lỗi xảy ra khi tạo/phát audio! Vui lòng thử lại.');
+    await runCallback(onError);
 
     // Xóa file nếu có lỗi
     if (fs.existsSync(filePath)) {
